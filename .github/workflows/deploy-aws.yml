@@ -208,39 +208,23 @@ jobs:
           REMOTE_SCRIPT
 
       # --- Copiar app y construir imagen Docker ---
-      - name: Copiar app al bastion y de ahí a la EC2 Docker
-        run: |
-          # Copiar los ficheros de la app al bastion
-          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no -r \
-            app/web-form/ ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/web-form/
-
-          # Desde el bastion, copiar a la EC2 Docker
-          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
-            ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
-
-            scp -o StrictHostKeyChecking=no -r \
-              /home/ubuntu/web-form/ ubuntu@${{ env.APP_PRIVATE_IP }}:/home/ubuntu/web-form/
-
-            # Limpiar copia del bastion
-            rm -rf /home/ubuntu/web-form/
-          REMOTE_SCRIPT
-
-      # --- Construir y levantar contenedor Docker ---
       - name: Construir imagen Docker y levantar contenedor
         run: |
-          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
-            ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
-
+          # Entrar al Bastion y ejecutar comandos en la EC2 Privada en un solo flujo
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
+            
+            # Ejecutar comandos directamente en la EC2 Docker desde el Bastion
             ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} << 'DOCKER_SCRIPT'
               cd /home/ubuntu/web-form
-
-              # Construir imagen Docker
+              
+              # 1. Construir imagen (silenciando avisos innecesarios)
               sudo docker build -t tfg-gym-app .
-
-              # Parar contenedor anterior si existe
+              
+              # 2. Limpieza de contenedores viejos
               sudo docker rm -f gym-app 2>/dev/null || true
-
-              # Levantar contenedor con las variables de conexión a RDS
+              
+              # 3. Levantar con las variables inyectadas desde GitHub
+              # Usamos -e de forma explícita para asegurar la conexión a RDS
               sudo docker run -d \
                 --name gym-app \
                 --restart unless-stopped \
@@ -251,28 +235,31 @@ jobs:
                 -e DB_NAME="gym" \
                 -e DB_PORT="3306" \
                 tfg-gym-app
-
-              # Verificar que el contenedor está corriendo
+              
+              # Espera corta para que Docker asigne la red
+              sleep 5
               sudo docker ps
-              echo "Contenedor Docker desplegado correctamente"
+              echo "✅ Contenedor Docker desplegado correctamente en la EC2 Privada"
             DOCKER_SCRIPT
           REMOTE_SCRIPT
 
       # --- Verificación final ---
       - name: Health check de la aplicación
         run: |
-          echo "Esperando 15s para que el contenedor arranque..."
-          sleep 15
+          echo "Esperando 20s para que RDS y PHP establezcan conexión..."
+          sleep 20
 
-          # Health check a través del bastion (HTTPS)
+          # El flag -k es vital porque el certificado del Bastion es autofirmado
           HEALTH=$(curl -sk https://${{ env.BASTION_IP }}/health.php 2>/dev/null || echo '{"status":"error"}')
-          echo "Health check response: $HEALTH"
+          echo "Respuesta del Health check: $HEALTH"
 
           if echo "$HEALTH" | grep -q '"status":"ok"'; then
-            echo "✅ Aplicación desplegada correctamente"
-            echo "🌐 Acceso web: https://${{ env.BASTION_IP }}"
-            echo "📋 Health check: https://${{ env.BASTION_IP }}/health.php"
+            echo "🚀 ÉXITO: Aplicación desplegada y conectada a la base de datos"
+            echo "🌐 URL: https://${{ env.BASTION_IP }}"
           else
-            echo "⚠️ La app podría necesitar más tiempo para arrancar"
-            echo "🔍 Verificar manualmente: https://${{ env.BASTION_IP }}"
+            echo "❌ ERROR: El health check falló. Verificando logs del contenedor..."
+            # Intentar ver logs si falla (ayuda mucho a depurar tu TFG)
+            ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no ubuntu@${{ env.BASTION_IP }} \
+              "ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} 'sudo docker logs gym-app --tail 20'"
+            exit 1
           fi
