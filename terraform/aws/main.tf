@@ -103,7 +103,7 @@ variable "key_name" {
 variable "public_key_path" {
   description = "Ruta local a la clave pública SSH (.pub) para crear el key pair en AWS"
   type        = string
-  default     = "~/.ssh/tfg-gym-key.pub"
+  default     = "./.ssh/tfg-gym-key.pub"
 }
 
 
