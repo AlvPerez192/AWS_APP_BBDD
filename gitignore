@@ -1,0 +1,30 @@
+# =============================================================================
+# .gitignore - TFG Infraestructura Multi-Cloud
+# =============================================================================
+
+# --- Terraform ---
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars        # Contiene db_password, NUNCA subir a GitHub
+*.tfplan
+crash.log
+
+# --- Claves SSH ---
+*.pem
+*.key
+tfg-gym-key
+tfg-gym-key.pub
+
+# --- Sistema ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# --- IDE ---
+.vscode/
+.idea/
+*.code-workspace

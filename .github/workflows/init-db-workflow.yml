@@ -1,0 +1,85 @@
+# =============================================================================
+# Workflow: Inicializar Base de Datos
+# =============================================================================
+# Ejecuta init.sql contra RDS a través del bastion.
+# Se puede usar independientemente del despliegue completo, por ejemplo
+# para reiniciar los datos de prueba sin destruir la infraestructura.
+#
+# Secretos necesarios:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+#   DB_PASSWORD, DB_USER
+#   SSH_PRIVATE_KEY
+#   BASTION_IP (o se pasa como input)
+#   RDS_ENDPOINT (o se pasa como input)
+# =============================================================================
+
+name: Initialize Database
+
+on:
+  workflow_dispatch:
+    inputs:
+      bastion_ip:
+        description: 'IP pública del bastion'
+        required: true
+      rds_endpoint:
+        description: 'Endpoint de RDS'
+        required: true
+
+jobs:
+  init-db:
+    name: Inicializar BD
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/tfg-gym-key
+          chmod 600 ~/.ssh/tfg-gym-key
+          ssh-keyscan -H ${{ github.event.inputs.bastion_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Copiar init.sql al bastion
+        run: |
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            sql/init.sql ubuntu@${{ github.event.inputs.bastion_ip }}:/home/ubuntu/init.sql
+
+      - name: Ejecutar init.sql contra RDS
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ github.event.inputs.bastion_ip }} << 'EOF'
+
+            # Esperar a que RDS sea accesible
+            for i in $(seq 1 15); do
+              if mysql -h ${{ github.event.inputs.rds_endpoint }} \
+                -u ${{ secrets.DB_USER }} -p'${{ secrets.DB_PASSWORD }}' \
+                -e "SELECT 1;" 2>/dev/null; then
+                echo "RDS accesible"
+                break
+              fi
+              echo "Esperando RDS... intento $i/15"
+              sleep 10
+            done
+
+            # Ejecutar SQL
+            mysql -h ${{ github.event.inputs.rds_endpoint }} \
+              -u ${{ secrets.DB_USER }} -p'${{ secrets.DB_PASSWORD }}' \
+              < /home/ubuntu/init.sql
+
+            # Verificar
+            echo "=== Tablas creadas ==="
+            mysql -h ${{ github.event.inputs.rds_endpoint }} \
+              -u ${{ secrets.DB_USER }} -p'${{ secrets.DB_PASSWORD }}' \
+              -e "USE gym; SHOW TABLES;"
+
+            echo "=== Clientes de prueba ==="
+            mysql -h ${{ github.event.inputs.rds_endpoint }} \
+              -u ${{ secrets.DB_USER }} -p'${{ secrets.DB_PASSWORD }}' \
+              -e "USE gym; SELECT * FROM clientes;"
+
+            # Limpiar
+            rm -f /home/ubuntu/init.sql
+            echo "Base de datos inicializada correctamente"
+          EOF

@@ -1,0 +1,51 @@
+# =============================================================================
+# Workflow: Failover a Azure
+# =============================================================================
+# Se dispara cuando el health check detecta 3 fallos consecutivos en AWS.
+#
+# Pasos (se completarán en el segundo despliegue):
+#   1. terraform apply en terraform/azure/
+#   2. Descargar último backup de Azure Blob Storage
+#   3. Restaurar backup en Azure DB for MySQL
+#   4. Desplegar app en AKS (o VM+Docker en Azure)
+#   5. Verificar health check en Azure
+#   6. Actualizar estado: active_cloud = azure
+#
+# PENDIENTE: Este workflow se desarrollará junto con terraform/azure/main.tf
+# en la fase de Disaster Recovery del proyecto.
+# =============================================================================
+
+name: Failover to Azure
+
+on:
+  workflow_dispatch:
+  # También se puede disparar desde health-check-aws.yml:
+  # workflow_run:
+  #   workflows: ["Health Check AWS"]
+  #   types: [completed]
+
+jobs:
+  failover:
+    name: Failover a Azure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Placeholder - Failover a Azure
+        run: |
+          echo "============================================"
+          echo "FAILOVER A AZURE - PENDIENTE DE IMPLEMENTAR"
+          echo "============================================"
+          echo ""
+          echo "Este workflow se completará en la fase de DR:"
+          echo "  1. terraform apply terraform/azure/"
+          echo "  2. Restaurar backup en Azure DB"
+          echo "  3. Desplegar app en Azure"
+          echo "  4. Verificar health check"
+          echo ""
+          echo "Componentes necesarios (por crear):"
+          echo "  - terraform/azure/main.tf"
+          echo "  - Azure Blob Storage (backups)"
+          echo "  - CronJob de backup (mysqldump → Azure Blob)"

@@ -1,0 +1,109 @@
+# =============================================================================
+# Playbook: Configuración del Bastion Host
+# =============================================================================
+# Instala y configura:
+#   - Nginx como reverse proxy (HTTPS 443 → HTTP 80 en EC2 Docker)
+#   - mysql-client para ejecutar SQL contra RDS
+#   - Certificado SSL autofirmado
+#
+# Uso:
+#   ansible-playbook -i inventory/hosts.ini playbooks/setup-bastion.yml \
+#     -e "app_private_ip=10.0.11.XX"
+#
+# La variable app_private_ip es la IP privada de la EC2 Docker
+# (se obtiene con: terraform output app_private_ip)
+# =============================================================================
+
+---
+- name: Configurar bastion host
+  hosts: bastion
+  become: yes
+
+  vars:
+    app_private_ip: "{{ app_private_ip }}"
+
+  tasks:
+    # --- Actualizar sistema ---
+    - name: Actualizar paquetes del sistema
+      apt:
+        update_cache: yes
+        upgrade: dist
+      register: apt_update
+      retries: 3
+      delay: 10
+
+    # --- Instalar paquetes necesarios ---
+    - name: Instalar Nginx, mysql-client y utilidades
+      apt:
+        name:
+          - nginx
+          - mysql-client-8.0
+          - openssl
+        state: present
+
+    # --- Crear directorio para certificados SSL ---
+    - name: Crear directorio SSL
+      file:
+        path: /etc/nginx/ssl
+        state: directory
+        mode: '0700'
+
+    # --- Generar certificado SSL autofirmado ---
+    # PRODUCCIÓN: usar Let's Encrypt (certbot) o AWS ACM con ALB
+    - name: Generar certificado SSL autofirmado
+      command: >
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048
+        -keyout /etc/nginx/ssl/selfsigned.key
+        -out /etc/nginx/ssl/selfsigned.crt
+        -subj "/C=ES/ST=Madrid/L=Madrid/O=TFG/CN=tfg-gym"
+      args:
+        creates: /etc/nginx/ssl/selfsigned.crt
+
+    # --- Configurar Nginx como reverse proxy ---
+    - name: Configurar Nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          # Reverse proxy: HTTPS (443) → EC2 Docker (HTTP 80)
+          server {
+              listen 443 ssl;
+              server_name _;
+
+              ssl_certificate     /etc/nginx/ssl/selfsigned.crt;
+              ssl_certificate_key /etc/nginx/ssl/selfsigned.key;
+
+              location / {
+                  proxy_pass http://{{ app_private_ip }}:80;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              # Endpoint para health checks de GitHub Actions
+              location /health.php {
+                  proxy_pass http://{{ app_private_ip }}:80/health.php;
+                  proxy_set_header Host $host;
+              }
+          }
+
+          # Redirigir HTTP a HTTPS
+          server {
+              listen 80;
+              server_name _;
+              return 301 https://$host$request_uri;
+          }
+      notify: Reiniciar Nginx
+
+    # --- Asegurar que Nginx está activo ---
+    - name: Habilitar y arrancar Nginx
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Reiniciar Nginx
+      systemd:
+        name: nginx
+        state: restarted

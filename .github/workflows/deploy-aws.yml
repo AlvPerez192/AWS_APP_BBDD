@@ -1,0 +1,278 @@
+# =============================================================================
+# Workflow: Despliegue completo de AWS
+# =============================================================================
+# Orquesta todo el despliegue inicial:
+#   1. terraform apply → crea VPC, subredes, bastion, EC2 Docker, RDS
+#   2. Configura Nginx en el bastion (reverse proxy HTTPS → app)
+#   3. Ejecuta init.sql contra RDS vía bastion
+#   4. Construye imagen Docker en la EC2 y levanta el contenedor
+#
+# Secretos necesarios en GitHub:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+#   DB_PASSWORD, DB_USER
+#   SSH_PRIVATE_KEY (clave privada para conectar al bastion)
+#
+# Tiempo estimado: 10-15 minutos (RDS tarda ~5 min en crearse)
+# =============================================================================
+
+name: Deploy AWS Infrastructure
+
+on:
+  workflow_dispatch:  # Solo se ejecuta manualmente (botón en GitHub)
+    inputs:
+      action:
+        description: 'Acción a realizar'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  AWS_REGION: us-east-1
+  TF_WORKING_DIR: terraform/aws
+
+jobs:
+  # =========================================================================
+  # JOB 1: Terraform - Crear infraestructura
+  # =========================================================================
+  terraform:
+    name: Terraform ${{ github.event.inputs.action }}
+    runs-on: ubuntu-latest
+
+    outputs:
+      bastion_ip: ${{ steps.tf_output.outputs.bastion_ip }}
+      app_private_ip: ${{ steps.tf_output.outputs.app_private_ip }}
+      rds_endpoint: ${{ steps.tf_output.outputs.rds_endpoint }}
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false  # Para poder capturar outputs
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      # --- APPLY ---
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="admin_ip=0.0.0.0/0"
+          # NOTA: admin_ip=0.0.0.0/0 permite SSH desde cualquier IP.
+          # En producción se restringiría a los rangos de GitHub Actions
+          # o a la IP fija del administrador.
+
+      - name: Capturar outputs de Terraform
+        if: github.event.inputs.action == 'apply'
+        id: tf_output
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> $GITHUB_OUTPUT
+          echo "app_private_ip=$(terraform output -raw app_private_ip)" >> $GITHUB_OUTPUT
+          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
+
+      # --- DESTROY ---
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD }}"
+
+  # =========================================================================
+  # JOB 2: Configurar bastion + inicializar BD + desplegar app
+  # =========================================================================
+  configure:
+    name: Configurar y desplegar
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.event.inputs.action == 'apply'
+
+    env:
+      BASTION_IP: ${{ needs.terraform.outputs.bastion_ip }}
+      APP_PRIVATE_IP: ${{ needs.terraform.outputs.app_private_ip }}
+      RDS_ENDPOINT: ${{ needs.terraform.outputs.rds_endpoint }}
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      # --- Preparar clave SSH ---
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/tfg-gym-key
+          chmod 600 ~/.ssh/tfg-gym-key
+          # Añadir bastion a known_hosts para evitar prompt interactivo
+          ssh-keyscan -H ${{ env.BASTION_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      # --- Esperar a que las instancias estén listas ---
+      - name: Esperar a que el bastion esté listo
+        run: |
+          echo "Esperando a que el bastion complete el user_data..."
+          for i in $(seq 1 30); do
+            if ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+              ubuntu@${{ env.BASTION_IP }} "test -f /home/ubuntu/bastion-ready.txt" 2>/dev/null; then
+              echo "Bastion listo!"
+              break
+            fi
+            echo "Intento $i/30 - esperando 20s..."
+            sleep 20
+          done
+
+      # --- Configurar Nginx en el bastion ---
+      - name: Configurar Nginx reverse proxy en bastion
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
+
+            # Reemplazar PLACEHOLDER con la IP real de la EC2 Docker
+            sudo sed -i "s/PLACEHOLDER_APP_IP/${{ env.APP_PRIVATE_IP }}/g" \
+              /etc/nginx/sites-available/default
+
+            # Verificar configuración y reiniciar
+            sudo nginx -t && sudo systemctl restart nginx
+            echo "Nginx configurado con app IP: ${{ env.APP_PRIVATE_IP }}"
+          REMOTE_SCRIPT
+
+      # --- Inicializar la base de datos ---
+      - name: Copiar init.sql al bastion
+        run: |
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            sql/init.sql ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/init.sql
+
+      - name: Ejecutar init.sql contra RDS
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
+
+            echo "Esperando a que RDS esté accesible..."
+            for i in $(seq 1 30); do
+              if mysql -h ${{ env.RDS_ENDPOINT }} -u ${{ secrets.DB_USER }} \
+                -p'${{ secrets.DB_PASSWORD }}' -e "SELECT 1;" 2>/dev/null; then
+                echo "RDS accesible!"
+                break
+              fi
+              echo "Intento $i/30 - esperando 20s..."
+              sleep 20
+            done
+
+            # Ejecutar el script SQL
+            mysql -h ${{ env.RDS_ENDPOINT }} -u ${{ secrets.DB_USER }} \
+              -p'${{ secrets.DB_PASSWORD }}' < /home/ubuntu/init.sql
+
+            echo "Base de datos inicializada correctamente"
+
+            # Verificar
+            mysql -h ${{ env.RDS_ENDPOINT }} -u ${{ secrets.DB_USER }} \
+              -p'${{ secrets.DB_PASSWORD }}' -e "USE gym; SHOW TABLES;"
+
+            # Limpiar
+            rm -f /home/ubuntu/init.sql
+          REMOTE_SCRIPT
+
+      # --- Esperar a que la EC2 Docker esté lista ---
+      - name: Esperar a que la EC2 Docker esté lista
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
+
+            echo "Esperando a que la EC2 Docker esté lista..."
+            for i in $(seq 1 30); do
+              if ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} \
+                "test -f /home/ubuntu/app-ready.txt" 2>/dev/null; then
+                echo "EC2 Docker lista!"
+                break
+              fi
+              echo "Intento $i/30 - esperando 20s..."
+              sleep 20
+            done
+          REMOTE_SCRIPT
+
+      # --- Copiar app y construir imagen Docker ---
+      - name: Copiar app al bastion y de ahí a la EC2 Docker
+        run: |
+          # Copiar los ficheros de la app al bastion
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no -r \
+            app/web-form/ ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/web-form/
+
+          # Desde el bastion, copiar a la EC2 Docker
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
+
+            scp -o StrictHostKeyChecking=no -r \
+              /home/ubuntu/web-form/ ubuntu@${{ env.APP_PRIVATE_IP }}:/home/ubuntu/web-form/
+
+            # Limpiar copia del bastion
+            rm -rf /home/ubuntu/web-form/
+          REMOTE_SCRIPT
+
+      # --- Construir y levantar contenedor Docker ---
+      - name: Construir imagen Docker y levantar contenedor
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
+
+            ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} << 'DOCKER_SCRIPT'
+              cd /home/ubuntu/web-form
+
+              # Construir imagen Docker
+              sudo docker build -t tfg-gym-app .
+
+              # Parar contenedor anterior si existe
+              sudo docker rm -f gym-app 2>/dev/null || true
+
+              # Levantar contenedor con las variables de conexión a RDS
+              sudo docker run -d \
+                --name gym-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                -e DB_HOST="${{ env.RDS_ENDPOINT }}" \
+                -e DB_USER="${{ secrets.DB_USER }}" \
+                -e DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+                -e DB_NAME="gym" \
+                -e DB_PORT="3306" \
+                tfg-gym-app
+
+              # Verificar que el contenedor está corriendo
+              sudo docker ps
+              echo "Contenedor Docker desplegado correctamente"
+            DOCKER_SCRIPT
+          REMOTE_SCRIPT
+
+      # --- Verificación final ---
+      - name: Health check de la aplicación
+        run: |
+          echo "Esperando 15s para que el contenedor arranque..."
+          sleep 15
+
+          # Health check a través del bastion (HTTPS)
+          HEALTH=$(curl -sk https://${{ env.BASTION_IP }}/health.php 2>/dev/null || echo '{"status":"error"}')
+          echo "Health check response: $HEALTH"
+
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "✅ Aplicación desplegada correctamente"
+            echo "🌐 Acceso web: https://${{ env.BASTION_IP }}"
+            echo "📋 Health check: https://${{ env.BASTION_IP }}/health.php"
+          else
+            echo "⚠️ La app podría necesitar más tiempo para arrancar"
+            echo "🔍 Verificar manualmente: https://${{ env.BASTION_IP }}"
+          fi

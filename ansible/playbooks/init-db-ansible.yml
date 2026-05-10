@@ -1,0 +1,70 @@
+# =============================================================================
+# Playbook: Inicialización de la Base de Datos
+# =============================================================================
+# Copia el script init.sql al bastion y lo ejecuta contra RDS MySQL.
+# El bastion es el único punto que tiene acceso a RDS (por Security Group).
+#
+# Uso:
+#   ansible-playbook -i inventory/hosts.ini playbooks/init-db.yml \
+#     -e "rds_endpoint=tfg-gym-rds.xxxxx.us-east-1.rds.amazonaws.com" \
+#     -e "db_user=admin" \
+#     -e "db_password=TuPassword"
+#
+# En GitHub Actions estas variables vienen de los secretos del repositorio.
+# =============================================================================
+
+---
+- name: Inicializar base de datos RDS
+  hosts: bastion
+  become: no
+
+  vars:
+    rds_endpoint: "{{ rds_endpoint }}"
+    db_user: "{{ db_user }}"
+    db_password: "{{ db_password }}"
+
+  tasks:
+    # --- Copiar el script SQL al bastion ---
+    - name: Copiar init.sql al bastion
+      copy:
+        src: ../../sql/init.sql
+        dest: /home/ubuntu/init.sql
+        mode: '0644'
+
+    # --- Ejecutar el script SQL contra RDS ---
+    - name: Ejecutar init.sql contra RDS MySQL
+      shell: >
+        mysql -h {{ rds_endpoint }} -u {{ db_user }} -p'{{ db_password }}'
+        < /home/ubuntu/init.sql
+      register: sql_result
+      no_log: true  # No mostrar la contraseña en los logs
+
+    # --- Verificar que las tablas se crearon correctamente ---
+    - name: Verificar tablas creadas en la BD
+      shell: >
+        mysql -h {{ rds_endpoint }} -u {{ db_user }} -p'{{ db_password }}'
+        -e "USE gym; SHOW TABLES;"
+      register: tables_result
+      no_log: true
+
+    - name: Mostrar tablas creadas
+      debug:
+        msg: "{{ tables_result.stdout_lines }}"
+
+    # --- Verificar datos de prueba ---
+    - name: Verificar datos de prueba insertados
+      shell: >
+        mysql -h {{ rds_endpoint }} -u {{ db_user }} -p'{{ db_password }}'
+        -e "USE gym; SELECT COUNT(*) AS total_clientes FROM clientes;"
+      register: clientes_result
+      no_log: true
+
+    - name: Mostrar conteo de clientes
+      debug:
+        msg: "{{ clientes_result.stdout_lines }}"
+
+    # --- Limpiar fichero SQL del bastion ---
+    - name: Eliminar init.sql del bastion (seguridad)
+      file:
+        path: /home/ubuntu/init.sql
+        state: absent
