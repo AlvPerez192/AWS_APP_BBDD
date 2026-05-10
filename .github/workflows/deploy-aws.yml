@@ -208,6 +208,28 @@ jobs:
           REMOTE_SCRIPT
 
       # --- Copiar app y construir imagen Docker ---
+      - name: Copiar app al bastion y de ahí a la EC2 Docker
+        run: |
+          # 1. Crear la carpeta en el bastion antes de copiar (SOLUCION AL ERROR)
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no ubuntu@${{ env.BASTION_IP }} "mkdir -p /home/ubuntu/web-form/"
+
+          # 2. Copiar el contenido de la carpeta local al Bastion
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no -r app/web-form/* ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/web-form/
+
+          # 3. Desde el bastion, pasar los archivos a la EC2 Privada
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
+            
+            # Crear carpeta en la EC2 interna
+            ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} "mkdir -p /home/ubuntu/web-form/"
+            
+            # Copiar archivos del Bastion a la EC2 interna
+            scp -o StrictHostKeyChecking=no -r /home/ubuntu/web-form/* ubuntu@${{ env.APP_PRIVATE_IP }}:/home/ubuntu/web-form/
+
+            # Limpieza: borrar los archivos temporales del Bastion
+            rm -rf /home/ubuntu/web-form/
+          REMOTE_SCRIPT
+      # --- Construir y levantar contenedor Docker ---
       - name: Construir imagen Docker y levantar contenedor
         run: |
           # Entrar al Bastion y ejecutar comandos en la EC2 Privada en un solo flujo
