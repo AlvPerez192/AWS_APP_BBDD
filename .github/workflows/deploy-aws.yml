@@ -232,21 +232,19 @@ jobs:
       # --- Construir y levantar contenedor Docker ---
       - name: Construir imagen Docker y levantar contenedor
         run: |
-          # Entrar al Bastion y ejecutar comandos en la EC2 Privada en un solo flujo
+          # 1. Copiar la llave privada al Bastion para que pueda saltar a la EC2 Docker
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no ~/.ssh/tfg-gym-key ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/.ssh/id_rsa
+          
+          # 2. Darle permisos correctos a la llave en el Bastion
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no ubuntu@${{ env.BASTION_IP }} "chmod 600 /home/ubuntu/.ssh/id_rsa"
+
+          # 3. Ejecutar el flujo de Docker
           ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no ubuntu@${{ env.BASTION_IP }} << 'REMOTE_SCRIPT'
-            
-            # Ejecutar comandos directamente en la EC2 Docker desde el Bastion
+            # Ahora el Bastion ya tiene su propia llave para entrar en la EC2 Docker
             ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} << 'DOCKER_SCRIPT'
               cd /home/ubuntu/web-form
-              
-              # 1. Construir imagen (silenciando avisos innecesarios)
               sudo docker build -t tfg-gym-app .
-              
-              # 2. Limpieza de contenedores viejos
               sudo docker rm -f gym-app 2>/dev/null || true
-              
-              # 3. Levantar con las variables inyectadas desde GitHub
-              # Usamos -e de forma explícita para asegurar la conexión a RDS
               sudo docker run -d \
                 --name gym-app \
                 --restart unless-stopped \
@@ -257,12 +255,11 @@ jobs:
                 -e DB_NAME="gym" \
                 -e DB_PORT="3306" \
                 tfg-gym-app
-              
-              # Espera corta para que Docker asigne la red
-              sleep 5
               sudo docker ps
-              echo "✅ Contenedor Docker desplegado correctamente en la EC2 Privada"
             DOCKER_SCRIPT
+            
+            # Limpieza: borrar la llave del Bastion por seguridad tras el uso
+            rm -f /home/ubuntu/.ssh/id_rsa
           REMOTE_SCRIPT
 
       # --- Verificación final ---
