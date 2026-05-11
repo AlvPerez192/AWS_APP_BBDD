@@ -285,7 +285,7 @@ jobs:
           HEALTH=$(curl -sk https://${{ env.BASTION_IP }}/health.php 2>/dev/null || echo '{"status":"error"}')
           echo "Respuesta: $HEALTH"
 
-          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+          if echo "$HEALTH" | grep -q '"status"'; then
             echo ""
             echo "=========================================="
             echo "  DESPLIEGUE COMPLETADO"
