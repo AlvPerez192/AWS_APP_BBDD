@@ -1,0 +1,68 @@
+name: Backup RDS to S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      bastion_ip:
+        description: 'IP pública del bastion'
+        required: true
+      rds_endpoint:
+        description: 'Endpoint de RDS'
+        required: true
+
+jobs:
+  backup:
+    name: Dump RDS → S3
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/tfg-gym-key
+          chmod 600 ~/.ssh/tfg-gym-key
+          ssh-keyscan -H ${{ github.event.inputs.bastion_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Hacer dump de RDS y subir a S3
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ github.event.inputs.bastion_ip }} << EOF
+
+            # Generar nombre del fichero con fecha
+            TIMESTAMP=\$(date +%Y%m%d-%H%M%S)
+            DUMP_FILE="gym-backup-\${TIMESTAMP}.sql"
+
+            echo "Generando dump: \${DUMP_FILE}"
+
+            # mysqldump de la BD completa
+            mysqldump -h ${{ github.event.inputs.rds_endpoint }} \
+              -u ${{ secrets.DB_USER }} \
+              -p'${{ secrets.DB_PASSWORD }}' \
+              --single-transaction \
+              --routines \
+              --triggers \
+              gym > /home/ubuntu/\${DUMP_FILE}
+
+            echo "Dump generado: \$(du -h /home/ubuntu/\${DUMP_FILE})"
+
+            # Subir a S3
+            aws s3 cp /home/ubuntu/\${DUMP_FILE} \
+              s3://tfg-gym-backups/dumps/\${DUMP_FILE}
+
+            echo "Subido a s3://tfg-gym-backups/dumps/\${DUMP_FILE}"
+
+            # Limpiar fichero local
+            rm -f /home/ubuntu/\${DUMP_FILE}
+
+            # Listar backups existentes en S3
+            echo "=== Backups en S3 ==="
+            aws s3 ls s3://tfg-gym-backups/dumps/
+          EOF
