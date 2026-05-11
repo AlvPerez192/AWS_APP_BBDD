@@ -153,21 +153,30 @@ jobs:
           done
 
       # =================================================================
-      # PASO 3: Esperar a que la EC2 Docker tenga Docker instalado
+      # PASO 3: Asegurar que Docker está instalado en la EC2
       # =================================================================
-      - name: Esperar Docker en EC2
+      # No dependemos del user_data porque si la EC2 ya existía de un
+      # despliegue anterior, Terraform no vuelve a ejecutarlo.
+      # Este paso instala Docker si no está presente.
+      - name: Instalar Docker en EC2 si no existe
         run: |
           ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
             ubuntu@${{ env.BASTION_IP }} "
-            for i in \$(seq 1 30); do
-              if ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} \
-                'sudo docker info' 2>/dev/null | grep -q 'Server Version'; then
-                echo 'Docker OK en EC2!'
-                break
+            ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} '
+              if command -v docker &>/dev/null; then
+                echo \"Docker ya instalado\"
+                sudo docker --version
+              else
+                echo \"Docker no encontrado, instalando...\"
+                sudo apt-get update -y
+                sudo apt-get install -y docker.io
+                sudo systemctl start docker
+                sudo systemctl enable docker
+                sudo usermod -aG docker ubuntu
+                echo \"Docker instalado correctamente\"
+                sudo docker --version
               fi
-              echo \"Intento \$i/30 - esperando 20s...\"
-              sleep 20
-            done
+            '
           "
 
       # =================================================================
