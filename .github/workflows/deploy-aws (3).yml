@@ -1,0 +1,296 @@
+# =============================================================================
+# Workflow: Despliegue completo de AWS
+# =============================================================================
+# Orquesta todo el despliegue inicial:
+#   1. terraform apply → crea VPC, subredes, bastion, EC2 Docker, RDS
+#   2. Configura Nginx en el bastion (reverse proxy HTTPS → app)
+#   3. Ejecuta init.sql contra RDS vía bastion
+#   4. Construye imagen Docker en la EC2 y levanta el contenedor
+#
+# Secretos necesarios en GitHub:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+#   DB_PASSWORD, DB_USER
+#   SSH_PRIVATE_KEY (clave privada para conectar al bastion)
+#
+# Tiempo estimado: 10-15 minutos (RDS tarda ~5 min en crearse)
+# =============================================================================
+
+name: Deploy AWS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Acción a realizar'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  AWS_REGION: us-east-1
+  TF_WORKING_DIR: terraform/aws
+
+jobs:
+  # =========================================================================
+  # JOB 1: Terraform - Crear infraestructura
+  # =========================================================================
+  terraform:
+    name: Terraform ${{ github.event.inputs.action }}
+    runs-on: ubuntu-latest
+
+    outputs:
+      bastion_ip: ${{ steps.tf_output.outputs.bastion_ip }}
+      app_private_ip: ${{ steps.tf_output.outputs.app_private_ip }}
+      rds_endpoint: ${{ steps.tf_output.outputs.rds_endpoint }}
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="admin_ip=0.0.0.0/0"
+
+      - name: Capturar outputs de Terraform
+        if: github.event.inputs.action == 'apply'
+        id: tf_output
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> $GITHUB_OUTPUT
+          echo "app_private_ip=$(terraform output -raw app_private_ip)" >> $GITHUB_OUTPUT
+          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD }}"
+
+  # =========================================================================
+  # JOB 2: Configurar bastion + inicializar BD + desplegar app
+  # =========================================================================
+  configure:
+    name: Configurar y desplegar
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.event.inputs.action == 'apply'
+
+    env:
+      BASTION_IP: ${{ needs.terraform.outputs.bastion_ip }}
+      APP_PRIVATE_IP: ${{ needs.terraform.outputs.app_private_ip }}
+      RDS_ENDPOINT: ${{ needs.terraform.outputs.rds_endpoint }}
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      # =================================================================
+      # PASO 1: Preparar SSH en el runner + copiar clave al bastion
+      # =================================================================
+      - name: Configurar SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/tfg-gym-key
+          chmod 600 ~/.ssh/tfg-gym-key
+          ssh-keyscan -H ${{ env.BASTION_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          echo "Esperando a que el bastion acepte SSH..."
+          for i in $(seq 1 20); do
+            if ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              ubuntu@${{ env.BASTION_IP }} "echo ok" 2>/dev/null; then
+              echo "Bastion accesible!"
+              break
+            fi
+            echo "Intento $i/20 - esperando 15s..."
+            sleep 15
+          done
+
+          # Copiar clave al bastion para que pueda saltar a la EC2 Docker
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ~/.ssh/tfg-gym-key ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/.ssh/id_rsa
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} "chmod 600 /home/ubuntu/.ssh/id_rsa"
+
+      # =================================================================
+      # PASO 2: Esperar a que el bastion termine su user_data
+      # =================================================================
+      - name: Esperar user_data del bastion
+        run: |
+          for i in $(seq 1 30); do
+            if ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+              ubuntu@${{ env.BASTION_IP }} "test -f /home/ubuntu/bastion-ready.txt" 2>/dev/null; then
+              echo "Bastion configurado!"
+              break
+            fi
+            echo "Intento $i/30 - esperando 20s..."
+            sleep 20
+          done
+
+      # =================================================================
+      # PASO 3: Esperar a que la EC2 Docker tenga Docker instalado
+      # =================================================================
+      - name: Esperar Docker en EC2
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} "
+            for i in \$(seq 1 30); do
+              if ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} \
+                'sudo docker info' 2>/dev/null | grep -q 'Server Version'; then
+                echo 'Docker OK en EC2!'
+                break
+              fi
+              echo \"Intento \$i/30 - esperando 20s...\"
+              sleep 20
+            done
+          "
+
+      # =================================================================
+      # PASO 4: Configurar Nginx
+      # =================================================================
+      - name: Configurar Nginx
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} "
+            sudo sed -i 's/PLACEHOLDER_APP_IP/${{ env.APP_PRIVATE_IP }}/g' \
+              /etc/nginx/sites-available/default
+            sudo nginx -t && sudo systemctl restart nginx
+            echo 'Nginx OK -> ${{ env.APP_PRIVATE_IP }}:80'
+          "
+
+      # =================================================================
+      # PASO 5: Inicializar BD
+      # =================================================================
+      - name: Inicializar base de datos
+        run: |
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            sql/init.sql ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/init.sql
+
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} "
+            for i in \$(seq 1 30); do
+              if mysql -h ${{ env.RDS_ENDPOINT }} -u ${{ secrets.DB_USER }} \
+                -p'${{ secrets.DB_PASSWORD }}' -e 'SELECT 1;' 2>/dev/null; then
+                echo 'RDS accesible!'
+                break
+              fi
+              echo \"Intento \$i/30 - esperando 20s...\"
+              sleep 20
+            done
+            mysql -h ${{ env.RDS_ENDPOINT }} -u ${{ secrets.DB_USER }} \
+              -p'${{ secrets.DB_PASSWORD }}' < /home/ubuntu/init.sql
+            mysql -h ${{ env.RDS_ENDPOINT }} -u ${{ secrets.DB_USER }} \
+              -p'${{ secrets.DB_PASSWORD }}' -e 'USE gym; SHOW TABLES;'
+            rm -f /home/ubuntu/init.sql
+            echo 'BD inicializada'
+          "
+
+      # =================================================================
+      # PASO 6: Copiar app al bastion → EC2 Docker
+      # =================================================================
+      - name: Copiar ficheros de la app
+        run: |
+          # Runner → Bastion
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no -r \
+            app/web-form ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/web-form
+
+          # Bastion → EC2 Docker
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} "
+            scp -o StrictHostKeyChecking=no -r \
+              /home/ubuntu/web-form ubuntu@${{ env.APP_PRIVATE_IP }}:/home/ubuntu/web-form
+            rm -rf /home/ubuntu/web-form
+            echo 'Ficheros copiados a EC2 Docker'
+            ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} \
+              'ls -la /home/ubuntu/web-form/'
+          "
+
+      # =================================================================
+      # PASO 7: Construir imagen y levantar contenedor
+      # =================================================================
+      - name: Build y run Docker
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} "
+            ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} '
+              cd /home/ubuntu/web-form
+              sudo docker build -t tfg-gym-app .
+              sudo docker rm -f gym-app 2>/dev/null || true
+              sudo docker run -d \
+                --name gym-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                -e DB_HOST=\"${{ env.RDS_ENDPOINT }}\" \
+                -e DB_USER=\"${{ secrets.DB_USER }}\" \
+                -e DB_PASSWORD=\"${{ secrets.DB_PASSWORD }}\" \
+                -e DB_NAME=\"gym\" \
+                -e DB_PORT=\"3306\" \
+                tfg-gym-app
+              echo \"=== Contenedor ===\"
+              sudo docker ps
+            '
+          "
+
+      # =================================================================
+      # PASO 8: Limpieza de seguridad
+      # =================================================================
+      - name: Limpiar clave SSH del bastion
+        if: always()
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.BASTION_IP }} "rm -f /home/ubuntu/.ssh/id_rsa" 2>/dev/null || true
+
+      # =================================================================
+      # PASO 9: Health check
+      # =================================================================
+      - name: Health check
+        run: |
+          echo "Esperando 20s..."
+          sleep 20
+
+          HEALTH=$(curl -sk https://${{ env.BASTION_IP }}/health.php 2>/dev/null || echo '{"status":"error"}')
+          echo "Respuesta: $HEALTH"
+
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo ""
+            echo "=========================================="
+            echo "  DESPLIEGUE COMPLETADO"
+            echo "=========================================="
+            echo "  URL:    https://${{ env.BASTION_IP }}"
+            echo "  Health: https://${{ env.BASTION_IP }}/health.php"
+            echo "  SSH:    ssh -i tfg-gym-key ubuntu@${{ env.BASTION_IP }}"
+            echo "=========================================="
+          else
+            echo "Health check falló. Logs del contenedor:"
+            ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+              ubuntu@${{ env.BASTION_IP }} "
+              ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} \
+                'sudo docker logs gym-app --tail 30'
+            " 2>/dev/null || echo "No se pudieron obtener logs"
+            exit 1
+          fi
