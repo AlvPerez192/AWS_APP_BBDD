@@ -42,11 +42,11 @@ terraform {
       # y compatible con AWS Academy.
     }
   }
-backend "s3" {
+  backend "s3" {
     bucket = "tfg-gym-terraform-state"
     key    = "aws/terraform.tfstate"
     region = "us-east-1"
-  }
+    }
 }
 
 provider "aws" {
