@@ -226,13 +226,13 @@ jobs:
         run: |
           # Runner → Bastion
           scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no -r \
-            app/web-form ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/web-form
+            app/web-form ubuntu@${{ env.BASTION_IP }}:/home/ubuntu/
 
           # Bastion → EC2 Docker
           ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
             ubuntu@${{ env.BASTION_IP }} "
             scp -o StrictHostKeyChecking=no -r \
-              /home/ubuntu/web-form ubuntu@${{ env.APP_PRIVATE_IP }}:/home/ubuntu/web-form
+              /home/ubuntu/web-form ubuntu@${{ env.APP_PRIVATE_IP }}:/home/ubuntu/
             rm -rf /home/ubuntu/web-form
             echo 'Ficheros copiados a EC2 Docker'
             ssh -o StrictHostKeyChecking=no ubuntu@${{ env.APP_PRIVATE_IP }} \
