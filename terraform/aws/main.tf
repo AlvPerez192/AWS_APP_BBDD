@@ -473,7 +473,7 @@ resource "aws_instance" "bastion" {
     apt-get upgrade -y
 
     # --- Instalar Nginx y mysql-client ---
-    apt-get install -y nginx mysql-client-8.0
+    apt-get install -y nginx mysql-client-8.0 awscli
 
     # --- Crear certificado SSL autofirmado ---
     # PRODUCCIÓN: usar Let's Encrypt (certbot) o AWS ACM con ALB
