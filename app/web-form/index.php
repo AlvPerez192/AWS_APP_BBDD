@@ -1,449 +1,457 @@
 <?php
-// =============================================================================
-// TFG Infraestructura Multi-Cloud - Formulario CRUD Gimnasio
-// =============================================================================
-// Operaciones:
-//   - CREATE: Inscribir nuevo cliente con membresía
-//   - READ:   Listar todos los clientes inscritos
-//   - UPDATE: Modificar datos de un cliente existente
-//   - DELETE: Eliminar un cliente
-//
-// Variables de entorno (se pasan con docker run -e):
-//   DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, DB_PORT
-// =============================================================================
-
 $mensaje = "";
 $tipo = "";
 
-// --- Conexión a la base de datos ---
-$db_host     = getenv("DB_HOST");
-$db_user     = getenv("DB_USER");
+$db_host = getenv("DB_HOST");
+$db_user = getenv("DB_USER");
 $db_password = getenv("DB_PASSWORD");
-$db_name     = getenv("DB_NAME");
-$db_port     = getenv("DB_PORT") ?: 3306;
+$db_name = getenv("DB_NAME");
+$db_port = getenv("DB_PORT") ?: 3306;
 
-/**
- * Crea y devuelve una conexión MySQLi.
- * Se usa una función para poder reutilizarla en cada operación.
- */
-function conectar($host, $user, $pass, $name, $port) {
-    $conn = new mysqli($host, $user, $pass, $name, $port);
-    if ($conn->connect_error) {
-        return null;
-    }
-    $conn->set_charset("utf8mb4");
-    return $conn;
-}
-
-// --- Procesar acciones del formulario ---
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
-    $accion = $_POST["accion"] ?? "";
-    $conexion = conectar($db_host, $db_user, $db_password, $db_name, $db_port);
+    $dni_cliente = $_POST["dni_cliente"];
+    $nombre = $_POST["nombre"];
+    $edad = $_POST["edad"];
+    $sexo = $_POST["sexo"];
+    $id_membresia = $_POST["id_membresia"];
 
-    if (!$conexion) {
-        $mensaje = "Error de conexión con la base de datos.";
+    $dni_empleado = "11111111A";
+
+    $conexion = new mysqli($db_host, $db_user, $db_password, $db_name, $db_port);
+
+    if ($conexion->connect_error) {
+        $mensaje = "No se ha podido conectar con la base de datos. Detalle técnico: " . $conexion->connect_error;
         $tipo = "error";
     } else {
-        // =====================================================================
-        // CREATE - Inscribir nuevo cliente
-        // =====================================================================
-        if ($accion === "crear") {
-            $dni       = trim($_POST["dni_cliente"]);
-            $nombre    = trim($_POST["nombre"]);
-            $edad      = intval($_POST["edad"]);
-            $sexo      = $_POST["sexo"];
-            $membresia = intval($_POST["id_membresia"]);
-            // El recepcionista por defecto es '11111111A' (como en el ejemplo de Diego)
-            $empleado  = "11111111A";
+        try {
+            $conexion->begin_transaction();
 
-            try {
-                $conexion->begin_transaction();
+            $stmt_cliente = $conexion->prepare(
+                "INSERT INTO clientes (dni_cliente, nombre, edad, sexo)
+                 VALUES (?, ?, ?, ?)"
+            );
+            $stmt_cliente->bind_param("ssis", $dni_cliente, $nombre, $edad, $sexo);
+            $stmt_cliente->execute();
 
-                $stmt = $conexion->prepare(
-                    "INSERT INTO clientes (dni_cliente, nombre, edad, sexo) VALUES (?, ?, ?, ?)"
-                );
-                $stmt->bind_param("ssis", $dni, $nombre, $edad, $sexo);
-                $stmt->execute();
-                $stmt->close();
+            $stmt_venta = $conexion->prepare(
+                "INSERT INTO venta_alta (dni_cliente, dni_empleado, id_membresia, fecha)
+                 VALUES (?, ?, ?, CURDATE())"
+            );
+            $stmt_venta->bind_param("ssi", $dni_cliente, $dni_empleado, $id_membresia);
+            $stmt_venta->execute();
 
-                $stmt = $conexion->prepare(
-                    "INSERT INTO venta_alta (dni_cliente, dni_empleado, id_membresia, fecha) VALUES (?, ?, ?, CURDATE())"
-                );
-                $stmt->bind_param("ssi", $dni, $empleado, $membresia);
-                $stmt->execute();
-                $stmt->close();
+            $conexion->commit();
 
-                $conexion->commit();
-                $mensaje = "Cliente inscrito correctamente.";
-                $tipo = "ok";
-            } catch (Exception $e) {
-                $conexion->rollback();
-                $mensaje = "Error al inscribir: " . $e->getMessage();
-                $tipo = "error";
-            }
-        }
+            $mensaje = "Inscripción completada correctamente. El cliente ha sido registrado en la base de datos.";
+            $tipo = "ok";
 
-        // =====================================================================
-        // UPDATE - Modificar datos de un cliente
-        // =====================================================================
-        elseif ($accion === "editar") {
-            $dni    = trim($_POST["dni_cliente"]);
-            $nombre = trim($_POST["nombre"]);
-            $edad   = intval($_POST["edad"]);
-            $sexo   = $_POST["sexo"];
-
-            try {
-                $stmt = $conexion->prepare(
-                    "UPDATE clientes SET nombre = ?, edad = ?, sexo = ? WHERE dni_cliente = ?"
-                );
-                $stmt->bind_param("siss", $nombre, $edad, $sexo, $dni);
-                $stmt->execute();
-
-                if ($stmt->affected_rows > 0) {
-                    $mensaje = "Cliente actualizado correctamente.";
-                    $tipo = "ok";
-                } else {
-                    $mensaje = "No se encontró el cliente con DNI: $dni";
-                    $tipo = "error";
-                }
-                $stmt->close();
-            } catch (Exception $e) {
-                $mensaje = "Error al actualizar: " . $e->getMessage();
-                $tipo = "error";
-            }
-        }
-
-        // =====================================================================
-        // DELETE - Eliminar un cliente
-        // =====================================================================
-        elseif ($accion === "eliminar") {
-            $dni = trim($_POST["dni_eliminar"]);
-
-            try {
-                // Primero eliminar registros dependientes (FK)
-                $conexion->begin_transaction();
-
-                // Eliminar entrenamientos del cliente
-                $stmt = $conexion->prepare("DELETE FROM entrenan WHERE dni_cliente = ?");
-                $stmt->bind_param("s", $dni);
-                $stmt->execute();
-                $stmt->close();
-
-                // Eliminar ventas del cliente
-                $stmt = $conexion->prepare("DELETE FROM venta_alta WHERE dni_cliente = ?");
-                $stmt->bind_param("s", $dni);
-                $stmt->execute();
-                $stmt->close();
-
-                // Eliminar el cliente
-                $stmt = $conexion->prepare("DELETE FROM clientes WHERE dni_cliente = ?");
-                $stmt->bind_param("s", $dni);
-                $stmt->execute();
-
-                if ($stmt->affected_rows > 0) {
-                    $mensaje = "Cliente eliminado correctamente.";
-                    $tipo = "ok";
-                } else {
-                    $mensaje = "No se encontró el cliente con DNI: $dni";
-                    $tipo = "error";
-                }
-                $stmt->close();
-
-                $conexion->commit();
-            } catch (Exception $e) {
-                $conexion->rollback();
-                $mensaje = "Error al eliminar: " . $e->getMessage();
-                $tipo = "error";
-            }
+            $stmt_cliente->close();
+            $stmt_venta->close();
+        } catch (Exception $e) {
+            $conexion->rollback();
+            $mensaje = "No se ha podido guardar la inscripción. Detalle técnico: " . $e->getMessage();
+            $tipo = "error";
         }
 
         $conexion->close();
     }
 }
-
-// --- Obtener lista de clientes (READ) ---
-$clientes = [];
-$conexion = conectar($db_host, $db_user, $db_password, $db_name, $db_port);
-if ($conexion) {
-    $result = $conexion->query(
-        "SELECT c.dni_cliente, c.nombre, c.edad, c.sexo, m.nombre AS membresia, v.fecha
-         FROM clientes c
-         LEFT JOIN venta_alta v ON c.dni_cliente = v.dni_cliente
-         LEFT JOIN membresias m ON v.id_membresia = m.id_membresia
-         ORDER BY v.fecha DESC, c.nombre ASC"
-    );
-    if ($result) {
-        while ($row = $result->fetch_assoc()) {
-            $clientes[] = $row;
-        }
-        $result->free();
-    }
-    $conexion->close();
-}
 ?>
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gimnasio - Gestión de Clientes</title>
+    <title>Inscripción Gimnasio | Área de Altas</title>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+        * {
+            box-sizing: border-box;
+        }
+
         body {
-            font-family: 'Segoe UI', Arial, sans-serif;
-            background: #f0f2f5;
-            padding: 20px;
-            color: #333;
-        }
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-        }
-        h1 {
-            text-align: center;
-            margin-bottom: 20px;
-            color: #1a1a2e;
-        }
-        h2 {
-            margin-bottom: 15px;
-            color: #16213e;
-            border-bottom: 2px solid #0f3460;
-            padding-bottom: 5px;
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, Helvetica, sans-serif;
+            background:
+                linear-gradient(rgba(10, 15, 25, 0.82), rgba(10, 15, 25, 0.82)),
+                linear-gradient(135deg, #111827, #1f2937, #374151);
+            color: #111827;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px 20px;
         }
 
-        /* Mensajes de estado */
-        .msg {
-            padding: 12px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            font-weight: bold;
-        }
-        .msg.ok { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .msg.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-
-        /* Secciones */
-        .card {
-            background: white;
-            padding: 25px;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            margin-bottom: 25px;
-        }
-
-        /* Formularios */
-        label { font-weight: 600; display: block; margin-top: 12px; }
-        input, select {
+        .page-wrapper {
             width: 100%;
-            padding: 10px;
-            margin-top: 4px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
+            max-width: 1050px;
+            display: grid;
+            grid-template-columns: 1fr 1.1fr;
+            background: #ffffff;
+            border-radius: 22px;
+            overflow: hidden;
+            box-shadow: 0 25px 70px rgba(0, 0, 0, 0.35);
+        }
+
+        .info-panel {
+            background: linear-gradient(160deg, #111827, #1f2937);
+            color: white;
+            padding: 48px 42px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .brand {
+            margin-bottom: 40px;
+        }
+
+        .brand-badge {
+            display: inline-block;
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            color: #e5e7eb;
+            padding: 8px 14px;
+            border-radius: 999px;
+            font-size: 13px;
+            letter-spacing: 0.4px;
+            margin-bottom: 22px;
+        }
+
+        .info-panel h1 {
+            font-size: 38px;
+            line-height: 1.1;
+            margin: 0 0 18px;
+        }
+
+        .info-panel p {
+            color: #d1d5db;
+            line-height: 1.6;
+            margin: 0;
+            font-size: 15px;
+        }
+
+        .features {
+            margin-top: 35px;
+            display: grid;
+            gap: 16px;
+        }
+
+        .feature {
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+            color: #e5e7eb;
             font-size: 14px;
         }
-        input:focus, select:focus {
-            border-color: #0f3460;
-            outline: none;
-            box-shadow: 0 0 3px rgba(15,52,96,0.3);
-        }
-        button {
-            width: 100%;
-            padding: 12px;
-            margin-top: 18px;
-            border: none;
-            border-radius: 4px;
-            font-size: 15px;
+
+        .feature-icon {
+            width: 26px;
+            height: 26px;
+            min-width: 26px;
+            border-radius: 50%;
+            background: #22c55e;
+            color: #052e16;
             font-weight: bold;
-            cursor: pointer;
-            transition: background 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
-        .btn-crear { background: #0f3460; color: white; }
-        .btn-crear:hover { background: #16213e; }
-        .btn-editar { background: #e67e22; color: white; }
-        .btn-editar:hover { background: #d35400; }
-        .btn-eliminar { background: #e74c3c; color: white; padding: 6px 14px; width: auto; margin: 0; font-size: 13px; }
-        .btn-eliminar:hover { background: #c0392b; }
 
-        /* Tabla de clientes */
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
+        .tech-note {
+            margin-top: 40px;
+            padding: 16px;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            color: #cbd5e1;
+            font-size: 13px;
+            line-height: 1.5;
         }
-        th {
-            background: #0f3460;
-            color: white;
-            padding: 10px;
-            text-align: left;
-        }
-        td {
-            padding: 10px;
-            border-bottom: 1px solid #eee;
-        }
-        tr:hover { background: #f5f6fa; }
 
-        /* Layout dos columnas para los formularios */
-        .forms-grid {
+        .form-panel {
+            padding: 48px 46px;
+            background: #f9fafb;
+        }
+
+        .form-header {
+            margin-bottom: 28px;
+        }
+
+        .form-header h2 {
+            margin: 0 0 10px;
+            font-size: 28px;
+            color: #111827;
+        }
+
+        .form-header p {
+            margin: 0;
+            color: #6b7280;
+            font-size: 15px;
+            line-height: 1.5;
+        }
+
+        .alert {
+            padding: 14px 16px;
+            border-radius: 12px;
+            margin-bottom: 22px;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .ok {
+            background: #ecfdf5;
+            color: #065f46;
+            border: 1px solid #a7f3d0;
+            font-weight: bold;
+        }
+
+        .error {
+            background: #fef2f2;
+            color: #991b1b;
+            border: 1px solid #fecaca;
+            font-weight: bold;
+        }
+
+        form {
+            display: grid;
+            gap: 18px;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .form-row {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 25px;
+            gap: 18px;
         }
-        @media (max-width: 700px) {
-            .forms-grid { grid-template-columns: 1fr; }
+
+        label {
+            font-size: 14px;
+            font-weight: bold;
+            color: #374151;
+            margin-bottom: 8px;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 13px 14px;
+            border: 1px solid #d1d5db;
+            border-radius: 12px;
+            font-size: 15px;
+            color: #111827;
+            background: white;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        input:focus, select:focus {
+            border-color: #2563eb;
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+        }
+
+        input::placeholder {
+            color: #9ca3af;
+        }
+
+        .help-text {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        button {
+            margin-top: 8px;
+            width: 100%;
+            padding: 15px;
+            border: none;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #2563eb, #1d4ed8);
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
+            box-shadow: 0 10px 20px rgba(37, 99, 235, 0.22);
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 14px 24px rgba(37, 99, 235, 0.28);
+            background: linear-gradient(135deg, #1d4ed8, #1e40af);
+        }
+
+        button:active {
+            transform: translateY(0);
         }
 
         .nota {
-            font-size: 12px;
-            color: #888;
-            text-align: center;
-            margin-top: 20px;
-        }
-        .info-cloud {
-            text-align: center;
+            margin-top: 22px;
+            padding: 14px 16px;
+            border-radius: 12px;
+            background: #eef2ff;
+            color: #3730a3;
             font-size: 13px;
-            color: #666;
-            background: #eef;
-            padding: 8px;
-            border-radius: 4px;
-            margin-bottom: 20px;
+            line-height: 1.5;
+            border: 1px solid #c7d2fe;
+        }
+
+        .footer-text {
+            margin-top: 18px;
+            color: #9ca3af;
+            font-size: 12px;
+            text-align: center;
+        }
+
+        @media (max-width: 850px) {
+            .page-wrapper {
+                grid-template-columns: 1fr;
+            }
+
+            .info-panel {
+                padding: 34px 28px;
+            }
+
+            .info-panel h1 {
+                font-size: 30px;
+            }
+
+            .form-panel {
+                padding: 34px 28px;
+            }
+        }
+
+        @media (max-width: 520px) {
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+
+            body {
+                padding: 20px 12px;
+            }
         }
     </style>
 </head>
 <body>
-<div class="container">
-    <h1>Gimnasio - Gestión de Clientes</h1>
+    <main class="page-wrapper">
+        <section class="info-panel">
+            <div>
+                <div class="brand">
+        
+                    <h1>¡Apúntate a nuestro gimnasio!</h1>
+                    <p>
+                        Disfrutarás de la mejor experiencia como socio, con máquinas de última generación y auténticos profesionales a tu lado.
+                    </p>
+                </div>
 
-    <div class="info-cloud">
-        Conectado a: <strong><?php echo htmlspecialchars($db_host ?: "No configurado"); ?></strong>
-        | Base de datos: <strong><?php echo htmlspecialchars($db_name ?: "N/A"); ?></strong>
-    </div>
+                <div class="features">
+                    <div class="feature">
+                        <div class="feature-icon">✓</div>
+                        <div>Cambios visibles</strong>.</div>
+                    </div>
+                    <div class="feature">
+                        <div class="feature-icon">✓</div>
+                        <div>Instalaciones nuevas</div>
+                    </div>
+                    <div class="feature">
+                        <div class="feature-icon">✓</div>
+                        <div>Profesionales a tu lado</div>
+                    </div>
+                </div>
+            </div>
 
-    <?php if ($mensaje !== ""): ?>
-        <div class="msg <?php echo $tipo; ?>">
-            <?php echo htmlspecialchars($mensaje); ?>
-        </div>
-    <?php endif; ?>
+            <div class="tech-note">
+                Infraestructura basada en AWS y GitHub creada por Álvaro Pérez y Diego Cárdenas como TFG para 2ASIR.
+            </div>
+        </section>
 
-    <!-- ================================================================= -->
-    <!-- FORMULARIOS: CREAR + EDITAR                                       -->
-    <!-- ================================================================= -->
-    <div class="forms-grid">
-        <!-- CREAR nuevo cliente -->
-        <div class="card">
-            <h2>Inscribir Cliente</h2>
+        <section class="form-panel">
+            <div class="form-header">
+                <h2>Nueva inscripción</h2>
+                <p>
+                    Introduce tus datos y selecciona la membresía que mejor se amolde a tus necesidades.
+                    Al enviar el formulario, el alta quedará registrada automáticamente.
+                </p>
+            </div>
+
+            <?php if ($mensaje !== ""): ?>
+                <div class="alert <?php echo $tipo; ?>">
+                    <?php echo htmlspecialchars($mensaje); ?>
+                </div>
+            <?php endif; ?>
+
             <form method="POST">
-                <input type="hidden" name="accion" value="crear">
+                <div class="form-group">
+                    <label for="dni_cliente">DNI</label>
+                    <input
+                        type="text"
+                        id="dni_cliente"
+                        name="dni_cliente"
+                        maxlength="20"
+                        placeholder="Ejemplo: 12345678A"
+                        required
+                    >
+                    
+                </div>
 
-                <label>DNI del cliente</label>
-                <input type="text" name="dni_cliente" maxlength="20" required
-                       placeholder="Ej: 12345678A">
+                <div class="form-group">
+                    <label for="nombre">Nombre completo</label>
+                    <input
+                        type="text"
+                        id="nombre"
+                        name="nombre"
+                        placeholder="Ejemplo: Laura Sánchez Martínez"
+                        required
+                    >
+                </div>
 
-                <label>Nombre completo</label>
-                <input type="text" name="nombre" required
-                       placeholder="Ej: Juan Pérez">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="edad">Edad</label>
+                        <input
+                            type="number"
+                            id="edad"
+                            name="edad"
+                            min="0"
+                            max="120"
+                            placeholder="Ejemplo: 28"
+                        >
+                    </div>
 
-                <label>Edad</label>
-                <input type="number" name="edad" min="0" max="120" required>
+                    <div class="form-group">
+                        <label for="sexo">Sexo</label>
+                        <select id="sexo" name="sexo">
+                            <option value="Hombre">Hombre</option>
+                            <option value="Mujer">Mujer</option>
+                            <option value="Otro">Otro</option>
+                        
+                        </select>
+                    </div>
+                </div>
 
-                <label>Sexo</label>
-                <select name="sexo">
-                    <option value="Hombre">Hombre</option>
-                    <option value="Mujer">Mujer</option>
-                    <option value="Otro">Otro</option>
-                    <option value="No especificado">No especificado</option>
-                </select>
+                <div class="form-group">
+                    <label for="id_membresia">Tipo de membresía</label>
+                    <select id="id_membresia" name="id_membresia" required>
+                        <option value="1">Básica — 29.99€ / mes</option>
+                        <option value="2">Premium — 49.99€ / mes</option>
+                        <option value="3">VIP — 79.99€ / mes</option>
+                    </select>
+                    <span class="help-text">La membresía seleccionada se asociará al alta.</span>
+                </div>
 
-                <label>Membresía</label>
-                <select name="id_membresia" required>
-                    <option value="1">Básica - 29.99€</option>
-                    <option value="2">Premium - 49.99€</option>
-                    <option value="3">VIP - 79.99€</option>
-                </select>
-
-                <button type="submit" class="btn-crear">Inscribir</button>
+                <button type="submit">Registrar inscripción</button>
             </form>
-        </div>
 
-        <!-- EDITAR cliente existente -->
-        <div class="card">
-            <h2>Editar Cliente</h2>
-            <form method="POST">
-                <input type="hidden" name="accion" value="editar">
-
-                <label>DNI del cliente a editar</label>
-                <input type="text" name="dni_cliente" maxlength="20" required
-                       placeholder="DNI existente">
-
-                <label>Nuevo nombre</label>
-                <input type="text" name="nombre" required
-                       placeholder="Nombre actualizado">
-
-                <label>Nueva edad</label>
-                <input type="number" name="edad" min="0" max="120" required>
-
-                <label>Nuevo sexo</label>
-                <select name="sexo">
-                    <option value="Hombre">Hombre</option>
-                    <option value="Mujer">Mujer</option>
-                    <option value="Otro">Otro</option>
-                    <option value="No especificado">No especificado</option>
-                </select>
-
-                <button type="submit" class="btn-editar">Actualizar</button>
-            </form>
-        </div>
-    </div>
-
-    <!-- ================================================================= -->
-    <!-- TABLA: LISTAR CLIENTES (READ) + ELIMINAR (DELETE)                 -->
-    <!-- ================================================================= -->
-    <div class="card">
-        <h2>Clientes Inscritos (<?php echo count($clientes); ?>)</h2>
-
-        <?php if (empty($clientes)): ?>
-            <p style="color: #888; text-align: center; padding: 20px;">
-                No hay clientes registrados todavía.
+            <p class="nota">
+                El alta se almacena en las tablas <strong>clientes</strong> y <strong>venta_alta</strong>
+                de la base de datos RDS MySQL.
             </p>
-        <?php else: ?>
-            <table>
-                <thead>
-                    <tr>
-                        <th>DNI</th>
-                        <th>Nombre</th>
-                        <th>Edad</th>
-                        <th>Sexo</th>
-                        <th>Membresía</th>
-                        <th>Fecha Alta</th>
-                        <th>Acción</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($clientes as $c): ?>
-                    <tr>
-                        <td><?php echo htmlspecialchars($c['dni_cliente']); ?></td>
-                        <td><?php echo htmlspecialchars($c['nombre']); ?></td>
-                        <td><?php echo htmlspecialchars($c['edad']); ?></td>
-                        <td><?php echo htmlspecialchars($c['sexo']); ?></td>
-                        <td><?php echo htmlspecialchars($c['membresia'] ?? 'Sin membresía'); ?></td>
-                        <td><?php echo htmlspecialchars($c['fecha'] ?? '-'); ?></td>
-                        <td>
-                            <form method="POST" style="display:inline;"
-                                  onsubmit="return confirm('¿Eliminar a <?php echo htmlspecialchars($c['nombre']); ?>?');">
-                                <input type="hidden" name="accion" value="eliminar">
-                                <input type="hidden" name="dni_eliminar"
-                                       value="<?php echo htmlspecialchars($c['dni_cliente']); ?>">
-                                <button type="submit" class="btn-eliminar">Eliminar</button>
-                            </form>
-                        </td>
-                    </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        <?php endif; ?>
-    </div>
 
-    <p class="nota">
-        TFG Infraestructura Multi-Cloud | Los datos se almacenan en Amazon RDS MySQL.
-    </p>
-</div>
+
+        </section>
+    </main>
 </body>
 </html>
