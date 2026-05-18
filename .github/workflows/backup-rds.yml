@@ -56,6 +56,8 @@ jobs:
             -p'${{ secrets.DB_PASSWORD }}' \
             --single-transaction \
             --skip-lock-tables \
+            --no-tablespaces \
+            --set-gtid-purged=OFF \
             --routines \
             --triggers \
             gym > /home/ubuntu/${DUMP_FILE}
