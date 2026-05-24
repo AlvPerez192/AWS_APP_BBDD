@@ -1,0 +1,77 @@
+name: Backup RDS to S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      bastion_ip:
+        description: 'IP pública del bastión'
+        required: true
+      rds_endpoint:
+        description: 'Endpoint DNS completo de RDS'
+        required: true
+
+jobs:
+  backup:
+    name: Dump RDS → S3
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/tfg-gym-key
+          chmod 600 ~/.ssh/tfg-gym-key
+          ssh-keyscan -H ${{ github.event.inputs.bastion_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Hacer dump de RDS y subir a S3
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no ubuntu@${{ github.event.inputs.bastion_ip }} bash <<'ENDSSH'
+          
+          if ! command -v aws &>/dev/null; then
+            echo "Instalando AWS CLI..."
+            sudo apt-get update -y && sudo apt-get install -y awscli
+          fi
+
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          export AWS_SESSION_TOKEN="${{ secrets.AWS_SESSION_TOKEN }}"
+          export AWS_DEFAULT_REGION=us-east-1
+
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          DUMP_FILE="gym-backup-${TIMESTAMP}.sql"
+
+          echo "Generando dump: ${DUMP_FILE}"
+
+          mysqldump -h ${{ github.event.inputs.rds_endpoint }} \
+            -u ${{ secrets.DB_USER }} \
+            -p'${{ secrets.DB_PASSWORD }}' \
+            --single-transaction \
+            --skip-lock-tables \
+            --no-tablespaces \
+            --set-gtid-purged=OFF \
+            --routines \
+            --triggers \
+            gym > /home/ubuntu/${DUMP_FILE}
+
+          echo "Dump generado: $(du -h /home/ubuntu/${DUMP_FILE})"
+
+          aws s3 cp /home/ubuntu/${DUMP_FILE} s3://tfg-gym-backups/dumps/${DUMP_FILE}
+
+          aws s3 cp /home/ubuntu/${DUMP_FILE} s3://tfg-gym-backups/dumps/latest.sql
+
+          echo "Subidos a s3://tfg-gym-backups/dumps/"
+
+          rm -f /home/ubuntu/${DUMP_FILE}
+
+          echo "=== Backups en S3 ==="
+          aws s3 ls s3://tfg-gym-backups/dumps/
+          ENDSSH
