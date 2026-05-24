@@ -1,0 +1,193 @@
+name: Backup RDS to S3 and Azure Blob
+
+on:
+  workflow_dispatch:
+    inputs:
+      bastion_ip:
+        description: 'IP pública del bastión'
+        required: true
+      rds_endpoint:
+        description: 'Endpoint DNS completo de RDS'
+        required: true
+
+  schedule:
+    - cron: '*/5 * * * *'
+
+jobs:
+  backup:
+    name: Dump RDS → S3 + Azure Blob
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          if [ -n "${{ github.event.inputs.bastion_ip }}" ]; then
+            BASTION_IP="${{ github.event.inputs.bastion_ip }}"
+          else
+            BASTION_IP="${{ vars.BASTION_IP }}"
+          fi
+          echo "BASTION_IP=${BASTION_IP}" >> $GITHUB_ENV
+
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/tfg-gym-key
+          chmod 600 ~/.ssh/tfg-gym-key
+          ssh-keyscan -H ${BASTION_IP} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Determinar endpoint RDS
+        run: |
+          if [ -n "${{ github.event.inputs.rds_endpoint }}" ]; then
+            echo "RDS_ENDPOINT=${{ github.event.inputs.rds_endpoint }}" >> $GITHUB_ENV
+          else
+            echo "RDS_ENDPOINT=${{ vars.RDS_ENDPOINT }}" >> $GITHUB_ENV
+          fi
+
+      - name: Hacer dump de RDS y subir a S3 + Azure Blob
+        shell: bash
+        env:
+          AWS_KEY_ID:        ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET:        ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_TOKEN:         ${{ secrets.AWS_SESSION_TOKEN }}
+          AZ_STORAGE_KEY:    ${{ secrets.AZURE_STORAGE_KEY }}
+          DB_USER_VAR:       ${{ secrets.DB_USER }}
+          DB_PASS_VAR:       ${{ secrets.DB_PASSWORD }}
+        run: |
+          # Pasamos los secretos al bastión a través de un fichero temporal
+          # para evitar problemas de escapado en el heredoc.
+          cat > /tmp/backup-env.sh <<ENVEOF
+          export AWS_ACCESS_KEY_ID='${AWS_KEY_ID}'
+          export AWS_SECRET_ACCESS_KEY='${AWS_SECRET}'
+          export AWS_SESSION_TOKEN='${AWS_TOKEN}'
+          export AWS_DEFAULT_REGION=us-east-1
+          export AZURE_STORAGE_KEY='${AZ_STORAGE_KEY}'
+          export AZURE_STORAGE_ACCOUNT=stgalvarospain2026
+          export DB_USER='${DB_USER_VAR}'
+          export DB_PASSWORD='${DB_PASS_VAR}'
+          export RDS_ENDPOINT='${RDS_ENDPOINT}'
+          ENVEOF
+
+          # Copiar fichero de credenciales al bastión
+          scp -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no \
+            /tmp/backup-env.sh ubuntu@${BASTION_IP}:/tmp/backup-env.sh
+
+          # Ejecutar el script de backup en el bastión
+          ssh -i ~/.ssh/tfg-gym-key -o StrictHostKeyChecking=no ubuntu@${BASTION_IP} bash <<'ENDSSH'
+          
+          # Cargar credenciales
+          source /tmp/backup-env.sh
+
+          # =================================================================
+          # Instalación de CLIs si no están presentes
+          # =================================================================
+
+          if ! command -v aws &>/dev/null; then
+            echo "Instalando AWS CLI..."
+            sudo apt-get update -y && sudo apt-get install -y awscli
+          fi
+
+          if ! command -v az &>/dev/null; then
+            echo "Instalando Azure CLI..."
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+          # =================================================================
+          # Generar dump de RDS
+          # =================================================================
+
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          DUMP_FILE="gym-backup-${TIMESTAMP}.sql"
+
+          echo "Generando dump: ${DUMP_FILE}"
+
+          mysqldump -h "${RDS_ENDPOINT}" \
+            -u "${DB_USER}" \
+            -p"${DB_PASSWORD}" \
+            --single-transaction \
+            --skip-lock-tables \
+            --no-tablespaces \
+            --set-gtid-purged=OFF \
+            --routines \
+            --triggers \
+            gym > /home/ubuntu/${DUMP_FILE}
+
+          echo "Dump generado: $(du -h /home/ubuntu/${DUMP_FILE})"
+
+          # =================================================================
+          # Subir a Amazon S3
+          # =================================================================
+
+          echo ""
+          echo "=== Subiendo a Amazon S3 ==="
+          
+          aws s3 cp /home/ubuntu/${DUMP_FILE} s3://tfg-gym-backups/dumps/${DUMP_FILE}
+          aws s3 cp /home/ubuntu/${DUMP_FILE} s3://tfg-gym-backups/dumps/latest.sql
+
+          echo "Subidos a s3://tfg-gym-backups/dumps/"
+
+          # =================================================================
+          # Subir a Azure Blob Storage
+          # =================================================================
+
+          echo ""
+          echo "=== Subiendo a Azure Blob Storage ==="
+
+          az storage blob upload \
+            --account-name "${AZURE_STORAGE_ACCOUNT}" \
+            --account-key "${AZURE_STORAGE_KEY}" \
+            --container-name db-backups \
+            --name "${DUMP_FILE}" \
+            --file /home/ubuntu/${DUMP_FILE} \
+            --overwrite \
+            --only-show-errors
+
+          az storage blob upload \
+            --account-name "${AZURE_STORAGE_ACCOUNT}" \
+            --account-key "${AZURE_STORAGE_KEY}" \
+            --container-name db-backups \
+            --name "latest.sql" \
+            --file /home/ubuntu/${DUMP_FILE} \
+            --overwrite \
+            --only-show-errors
+
+          echo "Subidos a Azure Blob Storage (container: db-backups)"
+
+          # =================================================================
+          # Limpiar
+          # =================================================================
+
+          rm -f /home/ubuntu/${DUMP_FILE}
+
+          # =================================================================
+          # Verificación
+          # =================================================================
+
+          echo ""
+          echo "=== Backups en S3 ==="
+          aws s3 ls s3://tfg-gym-backups/dumps/
+
+          echo ""
+          echo "=== Backups en Azure Blob ==="
+          az storage blob list \
+            --account-name "${AZURE_STORAGE_ACCOUNT}" \
+            --account-key "${AZURE_STORAGE_KEY}" \
+            --container-name db-backups \
+            --output table \
+            --only-show-errors
+
+          # Limpiar fichero de credenciales
+          rm -f /tmp/backup-env.sh
+
+          echo ""
+          echo "============================================"
+          echo "BACKUP COMPLETADO CON ÉXITO"
+          echo "  - S3:    s3://tfg-gym-backups/dumps/latest.sql"
+          echo "  - Azure: db-backups/latest.sql"
+          echo "============================================"
+          ENDSSH
