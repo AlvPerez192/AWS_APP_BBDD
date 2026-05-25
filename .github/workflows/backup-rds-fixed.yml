@@ -10,8 +10,8 @@ on:
         description: 'Endpoint DNS completo de RDS'
         required: true
 
-  schedule:
-    - cron: '*/5 * * * *'
+  #schedule:
+   # - cron: '*/5 * * * *'
 
 jobs:
   backup:
